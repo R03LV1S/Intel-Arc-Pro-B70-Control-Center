@@ -29,7 +29,7 @@ An interactive, crash-safe PowerShell control center for **Intel Arc Pro B70 32G
 
 1. **Windows 11** with **Resizable BAR (ReBAR)** enabled in motherboard BIOS.
 2. **Intel Graphics Driver `32.0.101.8860` or newer**.
-3. **`arc-gpu.exe` CLI** ([intel-arc-pro-fan-control](https://github.com/Grounded-In-Reality/intel-arc-pro-fan-control)) installed in `C:\Program Files\ArcGpuControl\`, on your system `PATH`, or placed in the same folder as `B70-ControlCenter.ps1`.
+3. **`arc-gpu.exe` CLI** ([exzile/intel-arc-pro-fan-control](https://github.com/exzile/intel-arc-pro-fan-control) — grab `ArcGpuControl-Setup.exe` from [Releases](https://github.com/exzile/intel-arc-pro-fan-control/releases), which installs `arc-gpu.exe` to `C:\Program Files\ArcFanControl\`).
 
 ---
 
