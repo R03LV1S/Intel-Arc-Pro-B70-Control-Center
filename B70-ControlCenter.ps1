@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    B70-ControlCenter.ps1 (v2.0 Standalone Direct-Driver Edition)
-    Zero-dependency interactive Power & SYCL Control Center for Intel Arc Pro B70 (32GB).
-    Calls C:\Windows\System32\ze_loader.dll (Intel Level Zero Sysman API) directly via inline C# P/Invoke.
-    No third-party binaries or external fan apps required.
+    B70-ControlCenter.ps1 (v2.2 Universal Direct-Driver + Multi-Mode Auto-Pilot Edition)
+    Zero-dependency interactive Power, SYCL & Dynamic Phase-Scaling Control Center
+    for the Intel Arc Pro B70 32GB (PCI ID 8086:e223).
+    Calls C:\Windows\System32\ze_loader.dll (Intel Level Zero Sysman) directly via C# P/Invoke.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("Interactive", "Lock", "Reset", "Status")]
+    [ValidateSet("Interactive", "Lock", "Reset", "AutoPilot", "BackgroundDaemon", "Status")]
     [string]$Action = "Interactive",
 
     [ValidateSet("Eco150W", "Peak165W", "Sustained180W", "Burst230W")]
@@ -32,10 +32,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit
 }
 
-# 2. Enable Level Zero Sysman in Process Before Loading ze_loader.dll
 $env:ZES_ENABLE_SYSMAN = "1"
 
-# 3. Compile Inline C# P/Invoke Bridge to C:\Windows\System32\ze_loader.dll
+# 2. Compile Inline C# P/Invoke Bridge to C:\Windows\System32\ze_loader.dll
 if (-not ("IntelLevelZeroSysman" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -48,13 +47,13 @@ public static class IntelLevelZeroSysman {
     public struct zes_power_sustained_limit_t {
         public int enabled;
         public int power;     // milliwatts (e.g., 165000 = 165W)
-        public int interval;  // milliseconds
+        public int interval;  // averaging window in milliseconds
     }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct zes_power_burst_limit_t {
         public int enabled;
-        public int power;     // milliwatts
+        public int power;     // milliwatts (e.g., 230000 = 230W)
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -103,13 +102,10 @@ public static class IntelLevelZeroSysman {
     [DllImport(ZE_DLL, CallingConvention = CallingConvention.Cdecl)]
     public static extern int zesPowerGetEnergyCounter(IntPtr hPower, ref zes_power_energy_counter_t pEnergy);
 
-    [DllImport(ZE_DLL, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int zesDeviceEnumFans(IntPtr hDevice, ref uint pCount, IntPtr[] phFan);
-
-    [DllImport(ZE_DLL, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int zesFanSetDefaultMode(IntPtr hFan);
+    private static IntPtr _cachedPowerHandle = IntPtr.Zero;
 
     public static IntPtr GetPrimaryPowerHandle() {
+        if (_cachedPowerHandle != IntPtr.Zero) return _cachedPowerHandle;
         zeInit(0);
         zesInit(0);
         uint drvCount = 0;
@@ -128,7 +124,8 @@ public static class IntelLevelZeroSysman {
                 if (zesDeviceEnumPowerDomains(devices[i], ref pwrCount, null) == 0 && pwrCount > 0) {
                     IntPtr[] pwrHandles = new IntPtr[pwrCount];
                     zesDeviceEnumPowerDomains(devices[i], ref pwrCount, pwrHandles);
-                    return pwrHandles[0];
+                    _cachedPowerHandle = pwrHandles[0];
+                    return _cachedPowerHandle;
                 }
             }
         }
@@ -147,7 +144,7 @@ public static class IntelLevelZeroSysman {
         return -1;
     }
 
-    public static bool SetSustainedWatts(int targetWatts) {
+    public static bool SetDualPowerLimits(int pl1SustainedWatts, int pl2BurstWatts, int intervalMs = 10000) {
         IntPtr hPower = GetPrimaryPowerHandle();
         if (hPower == IntPtr.Zero) return false;
         var sus = new zes_power_sustained_limit_t();
@@ -155,10 +152,11 @@ public static class IntelLevelZeroSysman {
         var pk  = new zes_power_peak_limit_t();
         zesPowerGetLimits(hPower, ref sus, ref bst, ref pk);
 
-        sus.enabled = 1;
-        sus.power   = targetWatts * 1000; // Convert Watts -> milliwatts
-        bst.enabled = 1;
-        bst.power   = Math.Min(230000, (targetWatts + 20) * 1000);
+        sus.enabled  = 1;
+        sus.power    = pl1SustainedWatts * 1000;
+        sus.interval = intervalMs;
+        bst.enabled  = 1;
+        bst.power    = Math.Min(230000, Math.Max(pl1SustainedWatts, pl2BurstWatts) * 1000);
 
         return zesPowerSetLimits(hPower, ref sus, ref bst, ref pk) == 0;
     }
@@ -181,15 +179,15 @@ public static class IntelLevelZeroSysman {
 "@
 }
 
-# 4. Persistent Lease File & Profiles
+# 3. Persistent Paths & Profiles
 $LeaseDir  = Join-Path $env:ProgramData "B70PowerLease"
 $LeaseFile = Join-Path $LeaseDir "b70_direct_lease.json"
 
 $Profiles = [ordered]@{
-    "Eco150W"       = @{ Name = "150W Eco (MoE & Quiet)";        Watts = 150 }
-    "Peak165W"      = @{ Name = "165W Peak Efficiency (0.148/W)"; Watts = 165 }
-    "Sustained180W" = @{ Name = "180W Sustained (27B & LongCtx)"; Watts = 180 }
-    "Burst230W"     = @{ Name = "230W Max Burst (Prefill/Batch)"; Watts = 230 }
+    "Eco150W"       = @{ Name = "150W Eco (MoE & Idle)";         PL1 = 150; PL2 = 185 }
+    "Peak165W"      = @{ Name = "165W Peak Efficiency (Decode)"; PL1 = 165; PL2 = 210 }
+    "Sustained180W" = @{ Name = "180W Sustained (Heavy Compute)";PL1 = 180; PL2 = 220 }
+    "Burst230W"     = @{ Name = "230W Max Burst (Prefill/Batch)";PL1 = 230; PL2 = 230 }
 }
 
 function Set-PersistentSyclEnv([bool]$Enable) {
@@ -220,35 +218,28 @@ function Set-PersistentSyclEnv([bool]$Enable) {
     }
 }
 
-function Get-B70DirectState {
-    $driverCeilingW = [IntelLevelZeroSysman]::GetSustainedWatts()
-    $liveDrawW      = [IntelLevelZeroSysman]::SampleLivePowerWatts(120)
-
-    $st = [ordered]@{
-        IsLocked          = $false
-        ActiveProfileName = "STOCK NORMAL (Unlocked / Auto)"
-        LockedWatts       = if ($driverCeilingW -gt 0) { $driverCeilingW } else { $StockWattsFallback }
-        StockWatts        = $StockWattsFallback
-        LockedSince       = "N/A"
-        DriverCeilingW    = if ($driverCeilingW -gt 0) { "$driverCeilingW W" } else { "Driver N/A" }
-        LivePowerDrawW    = if ($liveDrawW -ge 0) { "$liveDrawW W" } else { "N/A" }
-        SyclImmediate     = ([Environment]::GetEnvironmentVariable("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "User") -eq "1")
-    }
-
+function Stop-ExistingAutoPilotDaemon {
     if (Test-Path $LeaseFile) {
         try {
             $saved = Get-Content $LeaseFile -Raw | ConvertFrom-Json
-            $st.IsLocked          = $true
-            $st.ActiveProfileName = $saved.locked_profile_name
-            $st.LockedWatts       = [int]$saved.locked_watts
-            $st.StockWatts        = [int]$saved.stock_watts
-            $st.LockedSince       = $saved.locked_at_local
+            if ($saved.PSObject.Properties["daemon_pid"] -and $saved.daemon_pid -gt 0 -and $saved.daemon_pid -ne $PID) {
+                $proc = Get-Process -Id ([int]$saved.daemon_pid) -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
         } catch {}
     }
-    return $st
 }
 
-function Lock-B70Direct([string]$ProfileKey, [string]$ProfileName, [int]$TargetWatts) {
+function Save-LeaseState {
+    param(
+        [string]$ProfileKey,
+        [string]$ProfileName,
+        [int]$PL1Watts,
+        [int]$PL2Watts,
+        [int]$DaemonPid = 0
+    )
     if (-not (Test-Path $LeaseDir)) { New-Item -ItemType Directory -Path $LeaseDir -Force | Out-Null }
 
     $origStock = $StockWattsFallback
@@ -262,21 +253,27 @@ function Lock-B70Direct([string]$ProfileKey, [string]$ProfileName, [int]$TargetW
         if ($hwBase -gt 0) { $origStock = $hwBase }
     }
 
-    $ok = [IntelLevelZeroSysman]::SetSustainedWatts($TargetWatts)
-    Set-PersistentSyclEnv -Enable $true
-
     $lease = [ordered]@{
         locked_at_local     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         stock_watts         = $origStock
         locked_profile_key  = $ProfileKey
         locked_profile_name = $ProfileName
-        locked_watts        = $TargetWatts
-        driver_write_ok     = $ok
+        locked_watts        = $PL1Watts
+        locked_pl2_watts    = $PL2Watts
+        daemon_pid          = $DaemonPid
     }
     $lease | ConvertTo-Json | Set-Content -Path $LeaseFile -Encoding UTF8
 }
 
+function Lock-B70Direct([string]$ProfileKey, [string]$ProfileName, [int]$PL1Watts, [int]$PL2Watts) {
+    Stop-ExistingAutoPilotDaemon
+    [IntelLevelZeroSysman]::SetDualPowerLimits($PL1Watts, $PL2Watts, 10000) | Out-Null
+    Set-PersistentSyclEnv -Enable $true
+    Save-LeaseState -ProfileKey $ProfileKey -ProfileName $ProfileName -PL1Watts $PL1Watts -PL2Watts $PL2Watts -DaemonPid 0
+}
+
 function Reset-B70Direct {
+    Stop-ExistingAutoPilotDaemon
     $restoreW = $StockWattsFallback
     if (Test-Path $LeaseFile) {
         try {
@@ -284,59 +281,247 @@ function Reset-B70Direct {
             if ($saved.stock_watts) { $restoreW = [int]$saved.stock_watts }
         } catch {}
     }
-    [IntelLevelZeroSysman]::SetSustainedWatts($restoreW) | Out-Null
+    [IntelLevelZeroSysman]::SetDualPowerLimits($restoreW, ($restoreW + 30), 10000) | Out-Null
     if (Test-Path $LeaseFile) { Remove-Item -Path $LeaseFile -Force -ErrorAction SilentlyContinue }
     Set-PersistentSyclEnv -Enable $false
 }
 
-# 5. Interactive Menu Loop
+function Get-B70DirectState {
+    $driverCeilingW = [IntelLevelZeroSysman]::GetSustainedWatts()
+    $liveDrawW      = [IntelLevelZeroSysman]::SampleLivePowerWatts(120)
+
+    $st = [ordered]@{
+        IsLocked          = $false
+        ActiveProfileName = "STOCK NORMAL (Unlocked / Auto)"
+        LockedWatts       = if ($driverCeilingW -gt 0) { $driverCeilingW } else { $StockWattsFallback }
+        LockedPL2Watts    = if ($driverCeilingW -gt 0) { $driverCeilingW + 30 } else { 180 }
+        StockWatts        = $StockWattsFallback
+        LockedSince       = "N/A"
+        DaemonActive      = $false
+        DaemonPid         = 0
+        DriverCeilingW    = if ($driverCeilingW -gt 0) { "$driverCeilingW W" } else { "Driver N/A" }
+        LivePowerDrawW    = if ($liveDrawW -ge 0) { "$liveDrawW W" } else { "N/A" }
+        SyclImmediate     = ([Environment]::GetEnvironmentVariable("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "User") -eq "1")
+    }
+
+    if (Test-Path $LeaseFile) {
+        try {
+            $saved = Get-Content $LeaseFile -Raw | ConvertFrom-Json
+            $st.IsLocked          = $true
+            $st.ActiveProfileName = $saved.locked_profile_name
+            $st.LockedWatts       = [int]$saved.locked_watts
+            $st.LockedPL2Watts    = if ($saved.PSObject.Properties["locked_pl2_watts"]) { [int]$saved.locked_pl2_watts } else { [int]$saved.locked_watts }
+            $st.StockWatts        = [int]$saved.stock_watts
+            $st.LockedSince       = $saved.locked_at_local
+            if ($saved.PSObject.Properties["daemon_pid"] -and $saved.daemon_pid -gt 0) {
+                $p = Get-Process -Id ([int]$saved.daemon_pid) -ErrorAction SilentlyContinue
+                if ($p) {
+                    $st.DaemonActive = $true
+                    $st.DaemonPid    = [int]$saved.daemon_pid
+                }
+            }
+        } catch {}
+    }
+    return $st
+}
+
+# 4. Universal Telemetry Multi-Mode Auto-Pilot Engine (150W <-> 165W <-> 180W <-> 230W)
+function Invoke-SmartAutoPilotLoop([bool]$QuietBackground = $false) {
+    Set-PersistentSyclEnv -Enable $true
+    $currentTier   = "Eco150W"
+    $currentPL1    = 150
+    $currentPL2    = 185
+    $burstEntered  = [DateTime]::MinValue
+    $cooldownUntil = [DateTime]::MinValue
+    $highSamples   = 0
+    $lowSamples    = 0
+    $idleSamples   = 0
+
+    [IntelLevelZeroSysman]::SetDualPowerLimits($currentPL1, $currentPL2, 8000) | Out-Null
+    Save-LeaseState -ProfileKey "AutoPilot" -ProfileName "SMART AUTO-PILOT [150W Eco Standby]" -PL1Watts $currentPL1 -PL2Watts $currentPL2 -DaemonPid $PID
+
+    try {
+        while ($true) {
+            # Exit cleanly if the user pressed [0] Reset and deleted the lease file
+            if ($QuietBackground -and (-not (Test-Path $LeaseFile))) { break }
+
+            $draw = [IntelLevelZeroSysman]::SampleLivePowerWatts(250)
+            if ($draw -lt 0) {
+                Start-Sleep -Seconds 1
+                continue
+            }
+
+            $now     = [DateTime]::UtcNow
+            $nextTier = $currentTier
+
+            # State transitions based on real-time XMX compute vs GDDR6 memory-bound draw
+            if ($currentTier -eq "Burst230W") {
+                $burstSeconds = ($now - $burstEntered).TotalSeconds
+                if ($burstSeconds -ge 90.0) {
+                    # 90s thermal safety guardrail -> step down to 180W Sustained with 10s cooldown
+                    $nextTier      = "Sustained180W"
+                    $cooldownUntil = $now.AddSeconds(10)
+                    $lowSamples    = 0
+                } elseif ($draw -lt 178.0) {
+                    # Prefill finished! Workload is now GDDR6 memory-bound token decode (<178W)
+                    $lowSamples++
+                    if ($lowSamples -ge 5) {
+                        $nextTier   = "Peak165W"
+                        $lowSamples = 0
+                    }
+                } else {
+                    $lowSamples = 0
+                }
+            } else {
+                # Check for compute-bound prefill / batch surge
+                if ($draw -ge 156.0 -and $now -ge $cooldownUntil) {
+                    $highSamples++
+                    $idleSamples = 0
+                    if ($highSamples -ge 2) {
+                        $nextTier     = "Burst230W"
+                        $burstEntered = $now
+                        $highSamples  = 0
+                    }
+                } elseif ($draw -ge 135.0) {
+                    $highSamples = 0
+                    $idleSamples = 0
+                    $nextTier    = "Sustained180W"
+                } elseif ($draw -ge 36.0) {
+                    # Active token decode or medium inference -> hold 165W Peak Efficiency
+                    $highSamples = 0
+                    $idleSamples = 0
+                    $nextTier    = "Peak165W"
+                } else {
+                    # Idle (<36W) -> drop to 150W Eco after ~5 seconds
+                    $highSamples = 0
+                    $idleSamples++
+                    if ($idleSamples -ge 15) {
+                        $nextTier = "Eco150W"
+                    }
+                }
+            }
+
+            if ($nextTier -ne $currentTier) {
+                $currentTier = $nextTier
+                $pSpec       = $Profiles[$currentTier]
+                $currentPL1  = $pSpec.PL1
+                $currentPL2  = $pSpec.PL2
+                [IntelLevelZeroSysman]::SetDualPowerLimits($currentPL1, $currentPL2, 8000) | Out-Null
+                Save-LeaseState -ProfileKey "AutoPilot" -ProfileName "SMART AUTO-PILOT [$($pSpec.Name)]" -PL1Watts $currentPL1 -PL2Watts $currentPL2 -DaemonPid $PID
+            }
+
+            if (-not $QuietBackground) {
+                $phaseLabel = switch ($currentTier) {
+                    "Eco150W"       { "IDLE / STANDBY (150W PL1)" }
+                    "Peak165W"      { "TOKEN DECODE LOCK (165W PL1 / 210W PL2)" }
+                    "Sustained180W" { "HEAVY COMPUTE (180W PL1 / 220W PL2)" }
+                    "Burst230W"     { "⚡ XMX PREFILL / BATCH BURST (230W MAX)" }
+                }
+                Write-Host ("`r  Live Draw: {0,6} W  |  Active Tier: {1,-42}" -f $draw.ToString("0.0"), $phaseLabel) -NoNewline -ForegroundColor Yellow
+            }
+        }
+    } finally {
+        if (-not $QuietBackground) {
+            Write-Host "`n[AUTO-PILOT STOPPED] Restoring Stock Normal..." -ForegroundColor Cyan
+            Reset-B70Direct
+        }
+    }
+}
+
+# 5. CLI Non-Interactive Dispatch
+if ($Action -eq "Lock") {
+    $p  = $Profiles[$Profile]
+    $w1 = if ($Watts -gt 0) { $Watts } else { $p.PL1 }
+    $w2 = [Math]::Min(230, $w1 + 25)
+    Lock-B70Direct $Profile $p.Name $w1 $w2
+    return
+} elseif ($Action -eq "Reset") {
+    Reset-B70Direct
+    return
+} elseif ($Action -eq "AutoPilot") {
+    Write-Host "=== SMART MULTI-MODE AUTO-PILOT (150W <-> 165W <-> 180W <-> 230W) ===" -ForegroundColor Cyan
+    Write-Host "Press Ctrl+C at any time to stop and restore Stock Normal.`n" -ForegroundColor Gray
+    Invoke-SmartAutoPilotLoop -QuietBackground $false
+    return
+} elseif ($Action -eq "BackgroundDaemon") {
+    Invoke-SmartAutoPilotLoop -QuietBackground $true
+    return
+} elseif ($Action -eq "Status") {
+    (Get-B70DirectState) | Format-List
+    return
+}
+
+# 6. Interactive Menu Loop
 $banner = ""
 while ($true) {
     $st = Get-B70DirectState
     Clear-Host
     Write-Host "==========================================================================" -ForegroundColor Cyan
-    Write-Host "  INTEL ARC PRO B70 (32GB) DIRECT-DRIVER CONTROL CENTER (Zero-Dependency)" -ForegroundColor Cyan
-    Write-Host "  DRIVER API : C:\Windows\System32\ze_loader.dll (Level Zero Sysman)" -ForegroundColor Gray
+    Write-Host "  INTEL ARC PRO B70 (32GB) DIRECT-DRIVER & AUTO-PILOT CONTROL CENTER (v2.2)" -ForegroundColor Cyan
+    Write-Host "  DRIVER API : C:\Windows\System32\ze_loader.dll (Zero External Apps)" -ForegroundColor Gray
     Write-Host "==========================================================================" -ForegroundColor Cyan
 
-    if ($st.IsLocked) {
-        Write-Host ("  ACTIVE PROFILE   : [LOCKED] {0} ({1}W Target)" -f $st.ActiveProfileName, $st.LockedWatts) -ForegroundColor Yellow
-        Write-Host ("  LOCKED SINCE     : {0} (Persists across window closes)" -f $st.LockedSince) -ForegroundColor DarkYellow
+    if ($st.DaemonActive) {
+        Write-Host ("  ACTIVE PROFILE   : [AUTO-PILOT DAEMON PID {0}] {1}" -f $st.DaemonPid, $st.ActiveProfileName) -ForegroundColor Magenta
+        Write-Host ("  CURRENT LIMITS   : PL1 = {0}W Sustained  |  PL2 = {1}W Burst (Dynamic)" -f $st.LockedWatts, $st.LockedPL2Watts) -ForegroundColor Yellow
+    } elseif ($st.IsLocked) {
+        Write-Host ("  ACTIVE PROFILE   : [STATIC LOCK] {0}" -f $st.ActiveProfileName) -ForegroundColor Yellow
+        Write-Host ("  CURRENT LIMITS   : PL1 = {0}W Sustained  |  PL2 = {1}W Burst (Since {2})" -f $st.LockedWatts, $st.LockedPL2Watts, $st.LockedSince) -ForegroundColor DarkYellow
     } else {
         Write-Host ("  ACTIVE PROFILE   : [NORMAL] {0} ({1}W Factory Baseline)" -f $st.ActiveProfileName, $st.StockWatts) -ForegroundColor Green
     }
 
-    Write-Host ("  LIVE POWER DRAW  : {0}   |   DRIVER PL1 LIMIT : {1}" -f $st.LivePowerDrawW, $st.DriverCeilingW) -ForegroundColor White
+    Write-Host ("  LIVE POWER DRAW  : {0}   |   DRIVER PL1 READBACK : {1}" -f $st.LivePowerDrawW, $st.DriverCeilingW) -ForegroundColor White
     Write-Host ("  SYCL IMMEDIATE   : {0}" -f $(if ($st.SyclImmediate) { "ENABLED (User Env + Current Shell)" } else { "DEFAULT (Off)" })) -ForegroundColor Gray
     Write-Host "==========================================================================" -ForegroundColor Cyan
-    Write-Host "    [1] Lock 150W - Eco Mode          (MoE 30B-A3B & 9B Models)" -ForegroundColor Gray
-    Write-Host "    [2] Lock 165W - Peak Efficiency   (Best tok/s/W for Daily 9B-27B Chat)" -ForegroundColor Cyan
-    Write-Host "    [3] Lock 180W - Sustained Heavy   (Best for 27B Coding & 32K+ Context)" -ForegroundColor Yellow
-    Write-Host "    [4] Lock 230W - Max Hardware Burst(64K+ Prefill, Batch, Diffusion, 3D)" -ForegroundColor Magenta
-    Write-Host "    [5] Lock Custom Wattage           (Enter 100W - 230W)" -ForegroundColor Gray
-    Write-Host "    [0] RESET TO STOCK NORMAL         (Restores Factory Watts + Clears Env)" -ForegroundColor Green
-    Write-Host "    [R] Refresh Live Power Draw       [Q] Quit (Keeps profile active)" -ForegroundColor DarkGray
+    Write-Host "  STATIC LOCKS (With Hardware PL2 Burst Window):" -ForegroundColor White
+    Write-Host "    [1] Lock 150W PL1 / 185W PL2 - Eco Mode          (MoE 30B-A3B & 9B Models)" -ForegroundColor Gray
+    Write-Host "    [2] Lock 165W PL1 / 210W PL2 - Peak Efficiency   (Daily 9B-27B Chat)" -ForegroundColor Cyan
+    Write-Host "    [3] Lock 180W PL1 / 220W PL2 - Sustained Heavy   (27B Coding & 32K+ Ctx)" -ForegroundColor Yellow
+    Write-Host "    [4] Lock 230W PL1 / 230W PL2 - Max Hardware Burst(64K+ Prefill & Batching)" -ForegroundColor Magenta
+    Write-Host "    [5] Lock Custom Wattage      - Manual PL1 Target (100W - 230W)" -ForegroundColor Gray
+    Write-Host "  DYNAMIC MULTI-MODE AUTO-PILOT (150W <-> 165W <-> 180W <-> 230W):" -ForegroundColor White
+    Write-Host "    [6] Run Smart Auto-Pilot (Live Console)          (Resets on Ctrl+C)" -ForegroundColor Green
+    Write-Host "    [7] Start Background Auto-Pilot Daemon           (Runs after window closes!)" -ForegroundColor Green
+    Write-Host "    ----------------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "    [0] RESET TO STOCK NORMAL (Stops Daemon + Restores Factory Watts + Env)" -ForegroundColor Green
+    Write-Host "    [R] Refresh Live Power Draw                      [Q] Quit Window" -ForegroundColor DarkGray
     Write-Host "==========================================================================" -ForegroundColor Cyan
 
     if ($banner) { Write-Host "  STATUS: $banner`n" -ForegroundColor Green }
-    Write-Host -NoNewline "  Select [1-5, 0, R, Q]: " -ForegroundColor White
+    Write-Host -NoNewline "  Select [1-7, 0, R, Q]: " -ForegroundColor White
     $ch = [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
     Write-Host $ch
 
     switch ($ch) {
-        "1" { Lock-B70Direct "Eco150W"       $Profiles["Eco150W"].Name       150; $banner = "Locked 150W via ze_loader.dll." }
-        "2" { Lock-B70Direct "Peak165W"      $Profiles["Peak165W"].Name      165; $banner = "Locked 165W via ze_loader.dll." }
-        "3" { Lock-B70Direct "Sustained180W" $Profiles["Sustained180W"].Name 180; $banner = "Locked 180W via ze_loader.dll." }
-        "4" { Lock-B70Direct "Burst230W"     $Profiles["Burst230W"].Name     230; $banner = "Locked 230W via ze_loader.dll." }
+        "1" { $p = $Profiles["Eco150W"];       Lock-B70Direct "Eco150W"       $p.Name $p.PL1 $p.PL2; $banner = "Locked 150W PL1 / 185W PL2." }
+        "2" { $p = $Profiles["Peak165W"];      Lock-B70Direct "Peak165W"      $p.Name $p.PL1 $p.PL2; $banner = "Locked 165W PL1 / 210W PL2." }
+        "3" { $p = $Profiles["Sustained180W"]; Lock-B70Direct "Sustained180W" $p.Name $p.PL1 $p.PL2; $banner = "Locked 180W PL1 / 220W PL2." }
+        "4" { $p = $Profiles["Burst230W"];     Lock-B70Direct "Burst230W"     $p.Name $p.PL1 $p.PL2; $banner = "Locked 230W PL1 / 230W PL2." }
         "5" {
             $w = 0
-            $raw = Read-Host "`n  Enter Custom Watts (100-230)"
+            $raw = Read-Host "`n  Enter Custom Sustained PL1 Watts (100-230)"
             if ([int]::TryParse($raw, [ref]$w) -and $w -ge 100 -and $w -le 230) {
-                Lock-B70Direct "Custom${w}W" "Custom ${w}W Lock" $w
-                $banner = "Locked Custom ${w}W via ze_loader.dll."
+                $pl2 = [Math]::Min(230, $w + 25)
+                Lock-B70Direct "Custom${w}W" "Custom ${w}W PL1 / ${pl2}W PL2" $w $pl2
+                $banner = "Locked Custom ${w}W PL1 / ${pl2}W PL2."
             }
         }
-        "0" { Reset-B70Direct; $banner = "Restored Stock Normal via ze_loader.dll." }
+        "6" {
+            Stop-ExistingAutoPilotDaemon
+            Write-Host "`n[SMART AUTO-PILOT] Monitoring live XMX prefill vs GDDR6 decode power..." -ForegroundColor Cyan
+            Write-Host "Press Ctrl+C to exit Auto-Pilot and restore Stock Normal.`n" -ForegroundColor Gray
+            Invoke-SmartAutoPilotLoop -QuietBackground $false
+            $banner = "Exited Live Auto-Pilot and restored Stock Normal."
+        }
+        "7" {
+            Stop-ExistingAutoPilotDaemon
+            $bgArgs = @("-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", "-Action", "BackgroundDaemon")
+            $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $bgArgs -WindowStyle Hidden -PassThru
+            Start-Sleep -Milliseconds 600
+            $banner = "Started Background Auto-Pilot Daemon (PID $($proc.Id)). You can safely close this window!"
+        }
+        "0" { Reset-B70Direct; $banner = "Stopped any active daemon and restored Stock Normal." }
         "R" { $banner = "Sampled live energy counter at $((Get-Date).ToString('HH:mm:ss'))." }
         "Q" { break }
     }
