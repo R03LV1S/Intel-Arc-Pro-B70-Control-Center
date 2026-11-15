@@ -1,6 +1,6 @@
 # Intel Arc Pro B70 (32GB) Direct-Driver & Auto-Pilot Technical Guide (v2.2)
 
-This technical guide explains the hardware physics of the **Intel Arc Pro B70 32GB (`BMG-G31`, PCI ID `8086:e223`)**, how `B70-ControlCenter.ps1` (v2.2) communicates directly with **`C:\Windows\System32\ze_loader.dll`** with zero third-party tools, how the **Universal Telemetry Auto-Pilot** distinguishes compute-bound prompt prefills from memory-bound token decode, and how to tune **`llama.cpp` (SYCL & Vulkan)**, **LM Studio**, **OpenCode**, and **WSL2 (`vLLM XPU`)**.
+This technical guide explains the hardware physics of the **Intel Arc Pro B70 32GB (`BMG-G31`, PCI ID `8086:e223`)**, how `B70-ControlCenter.ps1` (v2.2) communicates directly with **`C:\Windows\System32\ze_loader.dll`** with zero third-party tools, how the **Universal Telemetry Auto-Pilot** distinguishes compute-bound prompt prefills from memory-bound token decode, and how to tune **`llama.cpp` (SYCL & Vulkan)**, **LM Studio**, **OpenCode**, **Ollama**, and **WSL2 (`vLLM XPU`)**.
 
 ---
 
@@ -14,8 +14,8 @@ This technical guide explains the hardware physics of the **Intel Arc Pro B70 32
 6. [Engine-Specific Optimization Guides](#6-engine-specific-optimization-guides)
    - [6.1 `llama.cpp` / `llama-server` (SYCL vs. Vulkan, MTP & DeltaNet Batch Sizing)](#61-llamacpp--llama-server-sycl-vs-vulkan-mtp--deltanet-batch-sizing)
    - [6.2 LM Studio, OpenCode & Desktop GUI Applications](#62-lm-studio-opencode--desktop-gui-applications)
-   - [6.3 WSL2 Ubuntu + `vLLM XPU` Hybrid Setup](#63-wsl2-ubuntu--vllm-xpu-hybrid-setup)
-7. [VRAM Ceiling Tiers & Hybrid Gated-DeltaNet KV-Cache Math](#7-vram-ceiling-tiers--hybrid-gated-deltanet-kv-cache-math)
+   - [6.3 WSL2 Ubuntu + `vLLM XPU` Setup](#63-wsl2-ubuntu--vllm-xpu-setup)
+7. [Safe VRAM Allocation & KV-Cache Memory Planning on 32GB GPUs](#7-safe-vram-allocation--kv-cache-memory-planning-on-32gb-gpus)
 8. [Troubleshooting & Level Zero Sysman Diagnostics](#8-troubleshooting--level-zero-sysman-diagnostics)
 
 ---
@@ -30,7 +30,7 @@ The **Intel Arc Pro B70 32GB** is built on the full **Battlemage `BMG-G31`** sil
 ### Compute-Bound Prefill vs. Memory-Bound Decode
 Every local LLM turn alternates between two fundamentally different hardware regimes:
 1. **Prompt Prefill & Parallel Batching (`GEMM` — 100% XMX Compute-Bound):** Processing an input prompt (`8K–262K` tokens) or evaluating 4–8 parallel streams multiplies dense matrices across thousands of tokens simultaneously, saturating all 256 XMX systolic arrays. Here, raw core boost clocks and power headroom (`180W–230W`) directly dictate speed.
-2. **Single-Stream Token Decode (`GEMV` — Memory-Bandwidth-Bound):** Generating one token at a time requires streaming all `17+ GB` of model weights across the **608 GB/s GDDR6 bus** for every step. Because the XMX units wait microsecond intervals between memory reads, stock workstation firmware misinterprets the workload as light and **drops core clocks and board power down to `60W–85W`**, costing 15% to 35% of your decode speed.
+2. **Single-Stream Token Decode (`GEMV` — Memory-Bandwidth-Bound):** Generating one token at a time requires streaming all `15–20 GB` of model weights across the **608 GB/s GDDR6 bus** for every step. Because the XMX units wait microsecond intervals between memory reads, stock workstation firmware misinterprets the workload as light and **drops core clocks and board power down to `60W–85W`**, costing 15% to 35% of your decode speed.
 
 ---
 
@@ -86,9 +86,9 @@ Options **`[6]` (Live Console Auto-Pilot)** and **`[7]` (Background Auto-Pilot D
 If you prefer a fixed static lock (`[1]`–`[5]`) instead of the dynamic Auto-Pilot (`[6]`/`[7]`):
 
 * **`[1]` 150W Eco (`PL1 = 150W / PL2 = 185W`):** Best for **MoE models (`30B-A3B`, `35B-A3B`)** and `1.7B–9B` dense models. MoE models only activate ~3B parameters per token, saturating the memory bus at 150W with minimal heat.
-* **`[2]` 165W Peak Efficiency (`PL1 = 165W / PL2 = 210W`):** Best static lock for **daily single-user 9B–27B interactive chat & coding** (`0.148 tok/s/W`). Notice that v2.2 includes a `210W PL2` burst window even in static `165W` mode so short prompt prefills still get hardware turbo headroom.
-* **`[3]` 180W Sustained Heavy (`PL1 = 180W / PL2 = 220W`):** Best static lock for **unattended 8-hour overnight autonomous agent loops**, `32K–128K` repository analysis, and multi-modal voice + LLM workloads.
-* **`[4]` 230W Max Hardware Burst (`PL1 = 230W / PL2 = 230W`):** Best for dedicated **benchmarking of `64K–262K` prompt prefills (+20.5% faster TTFT)**, **parallel code tournaments (`--parallel 4..8`, +18–24% throughput)**, **bulk vector-store RAG indexing**, **Flux/Wan diffusion**, and **Blender Cycles rendering**.
+* **`[2]` 165W Peak Efficiency (`PL1 = 165W / PL2 = 210W`):** Best static lock for **daily single-user 9B–27B interactive chat & coding** (`0.148 tok/s/W`). Includes a `210W PL2` burst window so short prompt prefills still get hardware turbo headroom.
+* **`[3]` 180W Sustained Heavy (`PL1 = 180W / PL2 = 220W`):** Best static lock for **continuous multi-hour compute sessions**, `32K–128K` codebase ingestion, and running multiple models concurrently.
+* **`[4]` 230W Max Hardware Burst (`PL1 = 230W / PL2 = 230W`):** Best for **`64K–262K` prompt prefills (+20.5% faster TTFT)**, **multi-stream parallel batching (`--parallel 4..8`, +18–24% throughput)**, **bulk embedding/RAG indexing**, **Flux/Wan image/video diffusion**, and **Blender Cycles rendering**.
 
 ---
 
@@ -120,7 +120,7 @@ ZES_ENABLE_SYSMAN                             = 1
 #### Optimal `llama-server` Command for `Qwen3.5` / `Qwen3.8` Hybrid DeltaNet Models
 ```powershell
 llama-server `
-  -m .\models\Qwen3.8-27B-TURBO-Q4_K_S-MTP.gguf `
+  -m .\models\your-model-Q4_K_S-MTP.gguf `
   -dev SYCL0 -ngl 999 -ncmoe 0 `
   -fa on -ctk q8_0 -ctv q4_1 `
   --spec-type draft-mtp --spec-draft-n-max 2 `
@@ -137,7 +137,7 @@ llama-server `
 ### 6.2 LM Studio, OpenCode & Desktop GUI Applications
 
 1. Open `B70-ControlCenter.ps1` and press **`[7]` (`Start Background Auto-Pilot Daemon`)**, then press **`[Q]`** to close the terminal.
-2. Launch **LM Studio** or **OpenCode** normally—it automatically inherits the User SYCL environment variables, while the background daemon scales the B70 between `150W` (idle), `230W` (prompt prefill), and `165W` (token streaming).
+2. Launch **LM Studio**, **OpenCode**, or your preferred GUI app—it automatically inherits the User SYCL environment variables, while the background daemon scales the B70 between `150W` (idle), `230W` (prompt prefill), and `165W` (token streaming).
 3. In your GUI app settings:
    * Enable **Flash Attention**.
    * Set **K-Cache Quantization** to **`Q8_0`** and **V-Cache Quantization** to **`Q4_1`** (or **`Q8_0`**).
@@ -146,32 +146,32 @@ llama-server `
 
 ---
 
-### 6.3 WSL2 Ubuntu + `vLLM XPU` Hybrid Setup
+### 6.3 WSL2 Ubuntu + `vLLM XPU` Setup
 
 Inside WSL2 Ubuntu, `/dev/dxg` paravirtualizes GPU compute calls to the Windows host driver, **but Linux tools inside WSL2 cannot modify physical hardware power limits**.
 * **How to Run:** Start the **Background Auto-Pilot Daemon (`[7]`)** in `B70-ControlCenter.ps1` on your **Windows 11 host**. Because `ze_loader.dll` samples the physical PCIe card's microjoule counters on the Windows host, it detects compute surges from your WSL2 Ubuntu `vLLM XPU` container automatically and scales the physical card between `150W`, `165W`, `180W`, and `230W` in real time.
 
 ---
 
-## 7. VRAM Ceiling Tiers & Hybrid Gated-DeltaNet KV-Cache Math
+## 7. Safe VRAM Allocation & KV-Cache Memory Planning on 32GB GPUs
 
-To prevent Windows WDDM from paging VRAM into shared system DDR5 RAM (which causes desktop freezes), leave **`1.50 GB to 1.60 GB`** of physical VRAM free for the OS compositor:
+To prevent Windows WDDM from paging VRAM into shared system DDR5 RAM (which causes desktop stuttering and severe inference slowdowns), always reserve **`1.60 GB to 2.40 GB`** of physical VRAM for the Windows desktop compositor:
 
-| GPU Physical VRAM | Recommended Max Ceiling % | Max Usable AI VRAM | Reserved OS / WDDM Buffer |
+| GPU Physical VRAM | Recommended Max VRAM Allocation % | Max Usable AI VRAM | Reserved OS / WDDM Safety Buffer |
 | :---: | :---: | :---: | :---: |
 | **8 GB** | 80% | **6.40 GB** | 1.60 GB |
 | **12 GB** | 85% | **10.20 GB** | 1.80 GB |
 | **16 GB** | 90% | **14.40 GB** | 1.60 GB |
 | **24 GB** | 90% | **21.60 GB** | 2.40 GB |
-| **32 GB (Arc Pro B70)** | **95%** (Interactive) / **90%** (Overnight) | **30.40 GB** / **28.80 GB** | **1.60 GB** / **3.20 GB** |
+| **32 GB (Arc Pro B70)** | **95%** | **30.40 GB** | **1.60 GB** |
 
 ### Why `Qwen3.5` & `Qwen3.8` Use Half the KV Cache of Older Models
 In `Qwen3.5-27B` and `Qwen3.8-27B` (64 layers total), **48 layers are Gated-DeltaNet linear attention layers** whose recurrent state is fixed at **`~150 MB` regardless of context length**. Only **16 layers** (+ 1 MTP layer) use growing KV caches (`4 KV heads`, `head_dim = 256`):
-* With `-fa on -ctk q8_0 -ctv q4_1`, the 27B model only consumes **`~25.5 KB per token`** (+ `0.15 GB` fixed state):
-  * **32K Context (`32,768`):** `~0.95 GB` KV cache
-  * **64K Context (`65,536`):** `~1.75 GB` KV cache
-  * **128K Context (`131,072`):** `~3.35 GB` KV cache (Fits with **both** a 9B [`6.55 GB`] and 27B [`17.10 GB`] model co-resident inside the B70's `30.40 GB` 95% ceiling!)
-  * **262K Context (`262,144`):** `~6.55 GB` KV cache (Fits with 4.9 GB to spare when the 27B model runs solo!)
+* With `-fa on -ctk q8_0 -ctv q4_1`, a 27B model (`~17.10 GB` weights in `Q4_K_S`) consumes only **`~25.5 KB per token`** (+ `0.15 GB` fixed state):
+  * **32K Context (`32,768`):** `~0.95 GB` KV cache (`~18.05 GB` total VRAM)
+  * **64K Context (`65,536`):** `~1.75 GB` KV cache (`~18.85 GB` total VRAM)
+  * **128K Context (`131,072`):** `~3.35 GB` KV cache (`~20.45 GB` total VRAM)
+  * **262K Context (`262,144`):** `~6.55 GB` KV cache (`~23.65 GB` total VRAM — fits easily inside the B70's `30.40 GB` usable ceiling!)
 
 ---
 
@@ -180,6 +180,6 @@ In `Qwen3.5-27B` and `Qwen3.8-27B` (64 layers total), **48 layers are Gated-Delt
 * **`DRIVER PL1 READBACK : Driver N/A` in the Status Header:**
   * **Cause:** PowerShell was launched without Administrator privileges. Right-click `B70-ControlCenter.ps1` and select **Run with PowerShell** so the automatic UAC elevation prompt runs.
 * **How to Verify If the Background Auto-Pilot Daemon (`[7]`) Is Running:**
-  * Simply open `B70-ControlCenter.ps1`. If the background daemon is running, the top banner displays in magenta:
+  * Open `B70-ControlCenter.ps1`. If the background daemon is running, the top banner displays in magenta:
     `ACTIVE PROFILE : [AUTO-PILOT DAEMON PID xxxx] SMART AUTO-PILOT [...]`
   * Pressing **`[0]`** (`Reset to Stock Normal`) or switching to any static profile (`[1]`–`[5]`) automatically terminates the background daemon PID before applying your new selection.
